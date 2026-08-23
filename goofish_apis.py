@@ -1,4 +1,4 @@
-'''
+r'''
 Description:
 Date: 2026-04-04 15:32:48
 LastEditTime: 2026-04-26 14:33:00
@@ -154,6 +154,17 @@ def qrcode_login(poll_interval: float = 3.0, timeout: float = 120.0,
     print(f'[qrcode_login] QR URL: {qr_url}')
     print(f'[qrcode_login] Scan with XianYu APP (top-left corner -> scan)')
 
+    # 同时保存一张 PNG 二维码，方便在终端外扫码
+    try:
+        import qrcode as qr_lib
+        _img_qr = qr_lib.QRCode(border=2, box_size=8)
+        _img_qr.add_data(qr_url)
+        _img_qr.make()
+        _img_qr.make_image().save('login_qr.png')
+        print('[qrcode_login] QR 图片已保存: login_qr.png')
+    except Exception as _e:
+        print(f'[qrcode_login] 保存二维码图片失败: {_e}')
+
     # 终端打印二维码（用半块字符 ▀▄█ 使其接近正方形）
     if show_qrcode:
         try:
@@ -292,7 +303,7 @@ class XianyuApis:
         self.device_id = device_id
         self.cookies = {}
 
-    def get_token(self):
+    def get_token(self, retry_count=0):
         headers = {
             "Host": "h5api.m.goofish.com",
             "sec-ch-ua-platform": "\"Windows\"",
@@ -332,7 +343,8 @@ class XianyuApis:
         token = self.session.cookies['_m_h5_tk'].split('_')[0]
         sign = generate_sign(params['t'], token, data_val)
         params['sign'] = sign
-        response = self.session.post(self.login_url, params=params, headers=headers, data=data)
+        response = self.session.post(self.login_url, params=params, headers=headers, data=data, timeout=20)
+        response.raise_for_status()
         for response_cookie_key in response.cookies.get_dict().keys():
             if response_cookie_key in self.session.cookies.get_dict().keys():
                 for key in self.session.cookies:
@@ -340,8 +352,10 @@ class XianyuApis:
                         self.session.cookies.clear(domain=key.domain, path=key.path, name=key.name)
                         break
         res_json = response.json()
-        if 'ret' in res_json and '令牌过期' in res_json['ret'][0]:
-            return self.get_token()
+        if 'ret' in res_json and res_json['ret'] and '令牌过期' in res_json['ret'][0]:
+            if retry_count >= 1:
+                return res_json
+            return self.get_token(retry_count + 1)
         return res_json
 
 
@@ -385,7 +399,8 @@ class XianyuApis:
         token = self.session.cookies['_m_h5_tk'].split('_')[0]
         sign = generate_sign(params['t'], token, data_val)
         params['sign'] = sign
-        response = self.session.post(self.refresh_token_url, headers=headers, params=params, data=data)
+        response = self.session.post(self.refresh_token_url, headers=headers, params=params, data=data, timeout=20)
+        response.raise_for_status()
         for response_cookie_key in response.cookies:
             if response_cookie_key in self.session.cookies:
                 for key in self.session.cookies:

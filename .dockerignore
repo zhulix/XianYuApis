@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.DS_Store
+.env
+.env.*
+.cookies_str
+login_qr.png
+data
+node_modules
+*.log

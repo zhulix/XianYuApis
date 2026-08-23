@@ -31,3 +31,8 @@ venv.bak/
 test.py
 test1.py
 test2.py
+.DS_Store
+.cookies_str
+.env
+login_qr.png
+data/

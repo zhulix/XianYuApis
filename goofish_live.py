@@ -1,20 +1,34 @@
 import base64
 import json
 import asyncio
-import threading
 import time
+from collections.abc import Awaitable, Callable
 
 from loguru import logger
 import websockets
 from goofish_apis import XianyuApis
 
-from utils.goofish_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt, \
+from utils.goofish_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, \
     get_session_cookies_str
-from message import Message, make_text, make_image
+from message import Message
+from xianyu_bridge.events import XianyuEvent
+from xianyu_bridge.parser import XianyuMessageParser
+
+
+def ws_connect(url, headers):
+    """兼容 websockets 新旧版本的连接头参数名（>=14 为 additional_headers）。"""
+    try:
+        return websockets.connect(url, additional_headers=headers,
+                                  ping_interval=20, ping_timeout=120)
+    except TypeError:
+        return websockets.connect(url, extra_headers=headers,
+                                  ping_interval=20, ping_timeout=120)
 
 
 class XianyuLive:
-    def __init__(self, cookies_str):
+    SEND_RESPONSE_TIMEOUT_SECONDS = 10
+
+    def __init__(self, cookies_str, event_handler: Callable[[XianyuEvent], Awaitable[None]] | None = None):
         self.base_url = 'wss://wss-goofish.dingtalk.com/'
         self.cookies_str = cookies_str
         self.cookies = trans_cookies(cookies_str)
@@ -22,6 +36,43 @@ class XianyuLive:
         self.device_id = generate_device_id(self.myid)
         self.xianyu = XianyuApis(self.cookies, self.device_id)
         self.ws = None
+        self.event_handler = event_handler
+        self.parser = XianyuMessageParser(self.myid)
+        self._pending_mid_futures: dict[str, asyncio.Future] = {}
+
+    def _dispatch_mid_response(self, message: dict) -> bool:
+        headers = message.get("headers") or {}
+        mid = str(headers.get("mid") or "")
+        future = self._pending_mid_futures.pop(mid, None)
+        if future is None or future.done():
+            return False
+        future.set_result(message)
+        return True
+
+    def _fail_pending_mid_requests(self, reason: str):
+        futures = list(self._pending_mid_futures.values())
+        self._pending_mid_futures.clear()
+        for future in futures:
+            if not future.done():
+                future.set_exception(ConnectionError(reason))
+
+    @staticmethod
+    def _send_response_error(response: dict) -> str | None:
+        code = response.get("code")
+        body = response.get("body") or {}
+        if not isinstance(body, dict):
+            body = {}
+        reason = body.get("reason") or body.get("message") or body.get("errorMessage") or body.get("error")
+        more_info = body.get("moreInfo")
+        if reason:
+            return "：".join(str(value) for value in (reason, more_info) if value)
+        try:
+            success = int(code) == 200
+        except (TypeError, ValueError):
+            success = False
+        if not success:
+            return f"闲鱼返回非成功状态：{code or '缺少状态码'}"
+        return None
 
     async def list_all_conversations(self, cid):
         headers = {
@@ -35,7 +86,7 @@ class XianyuLive:
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
-        async with websockets.connect(self.base_url, extra_headers=headers) as websocket:
+        async with ws_connect(self.base_url, headers) as websocket:
             asyncio.create_task(self.init(websocket))
             send_mid = generate_mid()
             msg = {
@@ -101,10 +152,11 @@ class XianyuLive:
                     return user_message_models
 
     async def create_chat(self, ws, toid, item_id='891198795482'):
+        mid = generate_mid()
         msg = {
             "lwp": "/r/SingleChatConversation/create",
             "headers": {
-                "mid": generate_mid()
+                "mid": mid
             },
             "body": [
                 {
@@ -122,17 +174,19 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
+        return {"success": True, "mid": mid}
 
-    async def send_msg(self, ws, cid, toid, message: Message):
+    async def send_msg(self, ws, cid, toid, message: Message, message_uuid: str | None = None):
         msg_type = message["type"]
+        mid = generate_mid()
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": mid
             },
             "body": [
                 {
-                    "uuid": generate_uuid(),
+                    "uuid": message_uuid or generate_uuid(),
                     "cid": f"{cid}@goofish",
                     "conversationType": 1,
                     "content": {
@@ -191,18 +245,48 @@ class XianyuLive:
         elif msg_type == "audio":
             # TODO: handle audio message
             logger.error(f"不支持的消息类型: {msg_type}")
-            return
+            return {"success": False, "error": f"不支持的消息类型: {msg_type}"}
         else:
             logger.error(f"不支持的消息类型: {msg_type}")
-            return
-        await ws.send(json.dumps(msg))
+            return {"success": False, "error": f"不支持的消息类型: {msg_type}"}
+        loop = asyncio.get_running_loop()
+        response_future = loop.create_future()
+        self._pending_mid_futures[mid] = response_future
+        try:
+            await ws.send(json.dumps(msg))
+            response = await asyncio.wait_for(
+                asyncio.shield(response_future),
+                timeout=self.SEND_RESPONSE_TIMEOUT_SECONDS,
+            )
+            error = self._send_response_error(response)
+            if error:
+                logger.warning("[闲鱼消息发送被拒绝] 账号：{}，消息MID：{}，原因：{}", self.myid, mid, error)
+                return {
+                    "success": False,
+                    "mid": mid,
+                    "code": response.get("code"),
+                    "error": error,
+                }
+            logger.info("[闲鱼消息发送确认] 账号：{}，消息MID：{}", self.myid, mid)
+            return {"success": True, "mid": mid, "code": response.get("code")}
+        except TimeoutError:
+            error = "等待闲鱼消息发送确认超时，发送结果未知"
+            logger.warning("[闲鱼消息发送结果未知] 账号：{}，消息MID：{}，原因：{}", self.myid, mid, error)
+            return {"success": False, "mid": mid, "unknown": True, "error": error}
+        except Exception as exc:
+            error = f"等待闲鱼消息发送确认失败：{exc}"
+            logger.warning("[闲鱼消息发送失败] 账号：{}，消息MID：{}，原因：{}", self.myid, mid, error)
+            return {"success": False, "mid": mid, "unknown": True, "error": error}
+        finally:
+            pending = self._pending_mid_futures.pop(mid, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     async def init(self, ws):
         data = self.xianyu.get_token()
         token = data['data']['accessToken'] if 'data' in data and 'accessToken' in data['data'] else ''
         if not token:
-            logger.error('获取token失败')
-            exit(0)
+            raise RuntimeError('获取闲鱼 WebSocket token 失败')
         msg = {
             "lwp": "/reg",
             "headers": {
@@ -249,10 +333,16 @@ class XianyuLive:
             await ws.send(json.dumps(msg))
             await asyncio.sleep(15)
 
-    def user_alive(self):
+    async def user_alive(self):
         while True:
-            time.sleep(600)
-            self.xianyu.refresh_token()
+            await asyncio.sleep(600)
+            try:
+                await asyncio.to_thread(self.xianyu.refresh_token)
+                logger.info("[闲鱼Token刷新完成] 账号：{}", self.myid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[闲鱼Token刷新失败] 账号：{}，原因：{}", self.myid, exc)
 
     async def main(self):
         headers = {
@@ -266,61 +356,48 @@ class XianyuLive:
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
-        threading.Thread(target=self.user_alive).start()
-        async with websockets.connect(self.base_url, extra_headers=headers) as websocket:
-            asyncio.create_task(self.init(websocket))
-            asyncio.create_task(self.heart_beat(websocket))
-            async for message in websocket:
-                # logger.info(f"message: {message}")
-                message = json.loads(message)
-                ack = {
-                    "code": 200,
-                    "headers": {
-                        "mid": message["headers"]["mid"] if "mid" in message["headers"] else generate_mid(),
-                        "sid": message["headers"]["sid"] if "sid" in message["headers"] else '',
+        async with ws_connect(self.base_url, headers) as websocket:
+            self.ws = websocket
+            tasks = [
+                asyncio.create_task(self.init(websocket), name=f"xianyu-init-{self.myid}"),
+                asyncio.create_task(self.heart_beat(websocket), name=f"xianyu-heartbeat-{self.myid}"),
+                asyncio.create_task(self.user_alive(), name=f"xianyu-token-{self.myid}"),
+            ]
+            try:
+                async for raw in websocket:
+                    message = json.loads(raw)
+                    self._dispatch_mid_response(message)
+                    headers_in = message.get("headers") or {}
+                    ack = {
+                        "code": 200,
+                        "headers": {
+                            "mid": headers_in.get("mid", generate_mid()),
+                            "sid": headers_in.get("sid", ""),
+                        },
                     }
-                }
-                if 'app-key' in message["headers"]:
-                    ack["headers"]["app-key"] = message["headers"]["app-key"]
-                if 'ua' in message["headers"]:
-                    ack["headers"]["ua"] = message["headers"]["ua"]
-                if 'dt' in message["headers"]:
-                    ack["headers"]["dt"] = message["headers"]["dt"]
-                await websocket.send(json.dumps(ack))
-
-                await self.handle_message(message, websocket)
+                    for key in ("app-key", "ua", "dt"):
+                        if key in headers_in:
+                            ack["headers"][key] = headers_in[key]
+                    await websocket.send(json.dumps(ack))
+                    await self.handle_message(message, websocket)
+            finally:
+                self.ws = None
+                self._fail_pending_mid_requests("闲鱼 WebSocket 连接已断开")
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def handle_message(self, message, websocket):
-        try:
-            data = message["body"]["syncPushPackage"]["data"][0]["data"]
-            data = json.loads(data)
-            # logger.info(f"无需解密 message: {data}")
-        except Exception as e:
-            try:
-                data = decrypt(data)
-                message = json.loads(data)
-                # logger.info(f"解密的 message: {message}")
-
-                send_user_name = message["1"]["10"]["reminderTitle"]
-                send_user_id = message["1"]["10"]["senderUserId"]
-                send_message = message["1"]["10"]["reminderContent"]
-                logger.info(f"user: {send_user_name}, 发送给我的信息 message: {send_message}")
-
-                cid = message["1"]["2"]
-                cid = cid.split('@')[0]
-
-                # 回复文字
-                # reply = f'Hello, {send_user_name}! I am a robot. I am not available now. I will reply to you later.'
-                reply = f'{send_user_name} 说了: {send_message}'
-                await self.send_msg(websocket, cid, send_user_id, make_text(reply))
-
-                # 回复图片
-                # res_json = self.xianyu.upload_media(r"D:\Desktop\1.png")
-                # image_object = res_json["object"]
-                # width, height = map(int, image_object["pix"].split('x'))
-                # await self.send_msg(websocket, cid, send_user_id, make_image(image_object["url"], width, height))
-            except Exception as e:
-                pass
+        events = self.parser.parse_envelope(message)
+        for event in events:
+            if event.buyer_id == self.myid:
+                continue
+            logger.info(
+                "[闲鱼事件接收] 账号：{}，类型：{}，事件ID：{}，会话ID：{}，订单ID：{}",
+                self.myid, event.event_type, event.event_id, event.chat_id, event.order_id,
+            )
+            if self.event_handler:
+                await self.event_handler(event)
 
 
 if __name__ == '__main__':

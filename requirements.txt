@@ -1,2 +1,11 @@
 requests
 loguru
+websockets>=14
+pydantic
+typing_extensions
+PyExecJS
+blackboxprotobuf
+qrcode[pil]
+fastapi>=0.115
+uvicorn>=0.34
+httpx>=0.28
