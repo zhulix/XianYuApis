@@ -46,8 +46,9 @@ class SignatureApiTest(unittest.TestCase):
         response = self.client.get("/health")
         self.assertEqual(200, response.status_code)
         self.assertTrue(response.json()["success"])
-        self.assertTrue(response.json()["capabilities"]["cancel"])
-        self.assertFalse(response.json()["capabilities"]["changePrice"])
+        self.assertTrue(response.json()["capabilities"]["createChat"])
+        self.assertNotIn("cancel", response.json()["capabilities"])
+        self.assertNotIn("changePrice", response.json()["capabilities"])
 
     def test_message_idempotency_key_is_stable_and_account_scoped(self):
         first = _message_uuid("a1", "meal-link:1")
@@ -74,98 +75,18 @@ class SignatureApiTest(unittest.TestCase):
         self.assertEqual(401, bad.status_code)
         self.assertEqual(200, good.status_code)
 
-    def test_change_price_is_explicitly_unsupported(self):
-        class FakePlatform:
-            def change_price(self, order_id, amount):
-                from xianyu_bridge.platform import UnsupportedXianyuOperation
-                raise UnsupportedXianyuOperation("订单改价", {"ret": ["UNSUPPORTED"]})
-
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=FakePlatform()):
-            response = self.request(
-                "POST", "/internal/accounts/a1/orders/o1/price", {"amount": "10.00"}
-            )
-        self.assertEqual(501, response.status_code)
-
-    def test_items_are_normalized_for_selection(self):
-        class FakePlatform:
-            def list_items(self, page, size):
-                return {"data": {"data": {"total": 2, "itemSearchResponseList": [
-                    {"itemId": "1001", "title": "在卖商品", "itemStatus": "0"},
-                    {"itemId": "1002", "title": "下架商品", "itemStatus": "-2"},
-                ]}}}
-
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=FakePlatform()):
-            response = self.request("GET", "/internal/accounts/a1/items")
-
-        self.assertEqual(200, response.status_code)
-        self.assertEqual("在卖", response.json()["data"]["list"][0]["statusName"])
-        self.assertEqual("下架", response.json()["data"]["list"][1]["statusName"])
-
-    def test_deliver_checks_order_state_and_is_idempotent(self):
-        class FakePlatform:
-            delivered = 0
-
-            def __init__(self, status):
-                self.status = status
-
-            def order_detail(self, order_id):
-                return {"data": {"status": self.status}}
-
-            def confirm_delivery(self, order_id):
-                self.delivered += 1
-                return {"ret": ["SUCCESS"]}
-
-        unpaid = FakePlatform("WAIT_BUYER_PAY")
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=unpaid):
-            response = self.request("POST", "/internal/accounts/a1/orders/o1/deliver", {})
-        self.assertEqual(409, response.status_code)
-        self.assertEqual(0, unpaid.delivered)
-
-        shipped = FakePlatform("SHIPPED")
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=shipped):
-            response = self.request("POST", "/internal/accounts/a1/orders/o1/deliver", {})
-        self.assertEqual(200, response.status_code)
-        self.assertTrue(response.json()["data"]["confirm"]["alreadyDelivered"])
-        self.assertEqual(0, shipped.delivered)
-
-        paid = FakePlatform("WAIT_SELLER_SEND_GOODS")
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=paid):
-            response = self.request("POST", "/internal/accounts/a1/orders/o1/deliver", {})
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(1, paid.delivered)
-
-    def test_cancel_only_allows_waiting_payment_and_is_idempotent(self):
-        class FakePlatform:
-            cancelled = 0
-
-            def __init__(self, status):
-                self.status = status
-
-            def order_detail(self, order_id):
-                return {"data": {"status": self.status}}
-
-            def cancel_order(self, order_id):
-                self.cancelled += 1
-                return {"ret": ["SUCCESS"]}
-
-        unpaid = FakePlatform("WAIT_BUYER_PAY")
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=unpaid):
-            response = self.request("POST", "/internal/accounts/a1/orders/o1/cancel", {})
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(1, unpaid.cancelled)
-
-        closed = FakePlatform("TRADE_CLOSED")
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=closed):
-            response = self.request("POST", "/internal/accounts/a1/orders/o1/cancel", {})
-        self.assertEqual(200, response.status_code)
-        self.assertTrue(response.json()["data"]["alreadyCancelled"])
-        self.assertEqual(0, closed.cancelled)
-
-        paid = FakePlatform("WAIT_SELLER_SEND_GOODS")
-        with patch("xianyu_bridge.api.runtime.manager.platform", return_value=paid):
-            response = self.request("POST", "/internal/accounts/a1/orders/o1/cancel", {})
-        self.assertEqual(409, response.status_code)
-        self.assertEqual(0, paid.cancelled)
+    def test_legacy_order_and_item_routes_are_removed(self):
+        for method, path in (
+            ("GET", "/internal/accounts/a1/orders"),
+            ("GET", "/internal/accounts/a1/items"),
+            ("GET", "/internal/accounts/a1/orders/o1"),
+            ("POST", "/internal/accounts/a1/orders/o1/price"),
+            ("POST", "/internal/accounts/a1/orders/o1/deliver"),
+            ("POST", "/internal/accounts/a1/orders/o1/cancel"),
+            ("POST", "/internal/accounts/a1/items/i1/offline"),
+            ("POST", "/internal/accounts/a1/orders/o1/refund"),
+        ):
+            self.assertEqual(404, self.request(method, path, {}).status_code)
 
 
 if __name__ == "__main__":

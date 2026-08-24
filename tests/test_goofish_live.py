@@ -83,6 +83,32 @@ class XianyuLiveSendMessageTest(unittest.IsolatedAsyncioTestCase):
             await future
         self.assertEqual({}, self.live._pending_mid_futures)
 
+    async def test_create_chat_waits_for_response_and_returns_chat_id(self):
+        websocket = FakeWebSocket(self.live, lambda request: {
+            "code": 200,
+            "headers": {"mid": request["headers"]["mid"]},
+            "body": {"data": {"conversationId": "chat-1@goofish"}},
+        })
+
+        result = await self.live.create_chat(websocket, "buyer-1", "item-1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual("chat-1", result["chatId"])
+        self.assertEqual("buyer-1@goofish", websocket.sent[0]["body"][0]["pairFirst"])
+        self.assertEqual({}, self.live._pending_mid_futures)
+
+    async def test_create_chat_does_not_report_success_without_chat_id(self):
+        websocket = FakeWebSocket(self.live, lambda request: {
+            "code": 200,
+            "headers": {"mid": request["headers"]["mid"]},
+            "body": {"success": True},
+        })
+
+        result = await self.live.create_chat(websocket, "buyer-1", "item-1")
+
+        self.assertFalse(result["success"])
+        self.assertIn("会话ID", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

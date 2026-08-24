@@ -15,7 +15,7 @@ from .events import XianyuEvent
 
 
 _ORDER_PATTERNS = (
-    re.compile(r"(?:bizOrderId|orderId|order_id|biz_order_id|tid)[=\"':%3D]+(\d{10,})", re.I),
+    re.compile(r"(?:bizOrderId|orderId|order_id|biz_order_id|tid)(?:=|%3D|[\"':])+(\d{10,})", re.I),
     re.compile(r"(?:order_detail\?id=|adjust_price\?.*?bizOrderId=)(\d{10,})", re.I),
 )
 _ITEM_PATTERNS = (
@@ -157,17 +157,8 @@ class XianyuMessageParser:
                 return None
 
     def _event_type(self, content: str | None, order_id: str | None, sender: Any) -> str:
-        text = f"{sender or ''} {content or ''}"
-        if order_id:
-            if any(word in text for word in ("已付款", "待发货", "等待卖家发货")):
-                return "ORDER_PAID"
-            if any(word in text for word in ("退款成功", "已退款", "退款完成")):
-                return "ORDER_REFUNDED"
-            if any(word in text for word in ("交易关闭", "订单关闭", "已取消")):
-                return "ORDER_CLOSED"
-            if any(word in text for word in ("已拍下", "待付款", "买家已拍")):
-                return "ORDER_CREATED"
-            return "ORDER_UPDATED"
+        # 订单状态已改由闲管家订单推送负责；聊天消息中的 order_id 仅作为
+        # 会话上下文保留，不能再根据文案猜测订单状态。
         return "CHAT_MESSAGE"
 
     @staticmethod

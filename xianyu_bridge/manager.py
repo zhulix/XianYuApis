@@ -8,7 +8,6 @@ from loguru import logger
 
 from goofish_live import XianyuLive
 from .events import XianyuEvent
-from .platform import XianyuPlatformClient
 
 
 class XianyuConnectionManager:
@@ -65,9 +64,6 @@ class XianyuConnectionManager:
         if not live:
             raise KeyError(f"账号 {account_id} 未启动")
         return live
-
-    def platform(self, account_id: str) -> XianyuPlatformClient:
-        return XianyuPlatformClient(self.get(account_id).xianyu)
 
     def status(self, account_id: str) -> dict:
         live = self.instances.get(str(account_id))

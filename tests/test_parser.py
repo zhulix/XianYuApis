@@ -45,11 +45,30 @@ class XianyuMessageParserTest(unittest.TestCase):
         event = self.parser.parse_message(message)
 
         self.assertEqual("seller-1:message-1", event.event_id)
-        self.assertEqual("ORDER_CREATED", event.event_type)
+        self.assertEqual("CHAT_MESSAGE", event.event_type)
         self.assertEqual("chat-1", event.chat_id)
         self.assertEqual("buyer-1", event.buyer_id)
         self.assertEqual("900052644277", event.item_id)
         self.assertEqual("2503688126356636370", event.order_id)
+
+    def test_order_id_starting_with_three_is_not_consumed_as_encoded_equals(self):
+        message = {
+            "1": {
+                "2": "66109728086@goofish",
+                "5": 1_787_566_333_025,
+                "10": {
+                    "senderUserId": "2219516588181",
+                    "extJson": json.dumps({"messageId": "message-order-3", "itemId": "1076092635518"}),
+                },
+                "6": {"3": {"5": json.dumps({
+                    "targetUrl": "fleamarket://adjust_price?flutter=true&bizOrderId=3316801009261031793"
+                })}},
+            }
+        }
+
+        event = self.parser.parse_message(message)
+
+        self.assertEqual("3316801009261031793", event.order_id)
 
     def test_image_payload_uses_real_url(self):
         content = {"contentType": 2, "image": {"pics": [{"url": "https://img.example/a.png"}]}}

@@ -1,25 +1,21 @@
 # Xianyu Bridge
 
-基于原 `XianYuApis` 的闲鱼协议能力，补成供 `laoxiangji server` 调用的独立 Sidecar。Python 负责登录态、WebSocket、闲鱼 HTTP 协议和事件可靠投递；Java 只负责业务编排与订单映射。
+这是供 `laoxiangji server` 调用的闲鱼消息 Sidecar。Python 负责闲鱼账号登录态、WebSocket 私信监听、创建会话和发送消息；Java 负责闲管家商品/订单业务、推送接收、订单详情查询、改价和短链编排。
 
-> 非闲鱼官方接口，协议可能变化。写操作必须保留人工兜底；严禁用于违法、骚扰、批量营销或绕过平台风控。
+> 本项目不是闲鱼官方接口，协议可能变化。写操作必须保留人工兜底；严禁用于违法、骚扰、批量营销或绕过平台风控。
 
-## 当前能力
+## 能力边界
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
-| 多闲鱼账号扫码登录、Cookie 复用 | 已实现 | 每账号独立 Cookie、Session 和 WebSocket |
-| WebSocket 私信监听、断线重连 | 已实现 | 结构化为统一事件，不在 Python 内自动回复 |
-| 文字/图片消息解析 | 已实现 | 未知卡片也保留原始载荷 |
-| 主动创建会话、发送文字 | 已实现 | 内部 API 调用 |
-| 卖家订单列表、订单详情 | 已实现 | 只读请求允许一次 token 刷新重试 |
-| 订单状态轮询补偿 | 已实现 | 防止 WebSocket 漏事件，默认 60 秒 |
-| 虚拟发货、取消待付款订单、商品下架 | 已实现 | 写请求绝不自动重放；发货/取消先查状态 |
-| 事件持久化和 Java 回调 | 已实现 | SQLite Outbox、事件 ID 去重、指数退避 |
+| 多闲鱼账号扫码登录、Cookie 复用 | 已实现 | 每个账号独立 Cookie、Session 和 WebSocket |
+| WebSocket 私信监听、断线重连 | 已实现 | 统一回调为 `CHAT_MESSAGE`，不根据聊天文案猜测订单状态 |
+| 文字/图片消息解析 | 已实现 | 未知卡片也保留消息上下文和原始载荷 |
+| 主动创建会话、发送文字 | 已实现 | 提供稳定幂等键，Java 可安全重试 |
+| 闲管家商品查询、订单查询、改价 | 不在本 Sidecar | 统一由 Java `goofish-sdk` 调用官方开放平台 |
+| 订单轮询、发货、取消、退款、商品操作 | 已移除 | Sidecar 不再保存或编排订单状态 |
+| 事件可靠回调 | 已实现 | SQLite Outbox、事件 ID 去重、指数退避 |
 | 双向 HMAC 鉴权 | 已实现 | 5 分钟时间窗和 nonce 防重放 |
-| 改价、卖家主动退款 | 明确不支持 | 协议尚未验证，接口返回 HTTP 501，不伪造成功 |
-
-本仓库没有复制 `xianyu-auto-reply` 的 AGPL 源码；只参考其产品能力边界，在原项目上独立实现所需桥接能力。
 
 ## 运行
 
@@ -33,27 +29,8 @@ set -a; source .env; set +a
 .venv/bin/python run_live.py
 ```
 
-首次运行没有账号时会生成 `login_qr.png` 并自动进入扫码。使用闲鱼 App 扫码后，Cookie 按账号保存到 `data/accounts/{accountId}.cookies`。二维码、Cookie 目录和 `.env` 都已加入 `.gitignore`；历史 `.cookies_str` 会兼容导入一次，但不会覆盖后来刷新的 Cookie。
-
-### 管理多个账号
-
-服务运行前或运行中都可以添加账号：
-
-```bash
-.venv/bin/python account_cli.py login
-```
-
-每执行一次登录一个账号。服务默认每 5 秒发现新增或刷新的 Cookie，并为该账号独立启动 WebSocket，无需重启。
-
-```bash
-# 只显示账号 ID，不显示 Cookie
-.venv/bin/python account_cli.py list
-
-# 移除账号；运行中的对应连接会自动停止
-.venv/bin/python account_cli.py remove 账号ID
-```
-
-同一账号重新执行 `login` 会安全替换其 Cookie 并重连，不影响其他账号。
+首次运行没有账号时会生成 `login_qr.png` 并进入扫码。Cookie 按账号保存到
+`data/accounts/{accountId}.cookies`。二维码、Cookie 目录和 `.env` 都已加入 `.gitignore`。
 
 只验证 HTTP 服务、暂不登录闲鱼时：
 
@@ -68,25 +45,17 @@ Docker 内监听需在 `.env` 设置 `XIANYU_HOST=0.0.0.0`：
 docker build -t xianyu-bridge .
 docker run -it --name xianyu-bridge --env-file .env -p 127.0.0.1:8090:8090 \
   -v xianyu-data:/app/data xianyu-bridge
-
-# 容器运行中添加另一个账号
-docker exec -it xianyu-bridge python account_cli.py login
 ```
 
 ## 配置
 
 以 [.env.example](.env.example) 为准：
 
-- `XIANYU_INTERNAL_SECRET`：Java 调 Python 的 HMAC 密钥；未配置时 `/internal/**` 返回 503。
-- `LXJ_EVENT_CALLBACK_URL`、`LXJ_EVENT_CALLBACK_SECRET`：Python 回调 Java；两项同时存在才发送。
-- `XIANYU_OUTBOX_PATH`：事件 SQLite 文件。
+- `XIANYU_INTERNAL_SECRET`：Java 调用 Sidecar 的 HMAC 密钥；未配置时 `/internal/**` 返回 503。
+- `LXJ_EVENT_CALLBACK_URL`、`LXJ_EVENT_CALLBACK_SECRET`：Sidecar 回调 Java；两项同时存在才发送。
+- `XIANYU_OUTBOX_PATH`：聊天事件 SQLite Outbox 文件。
 - `XIANYU_ACCOUNTS_DIR`：多账号 Cookie 目录，默认 `./data/accounts`。
 - `XIANYU_ACCOUNT_SYNC_INTERVAL`：新增、刷新、移除账号的发现间隔，默认 5 秒。
-- `XIANYU_ORDER_POLL_INTERVAL`：订单补偿轮询秒数，最小 5 秒。
-
-订单补偿会把每个订单最后观察到的状态保存在 `XIANYU_OUTBOX_PATH` 指向的
-SQLite 数据库 `order_sync_state` 表中。首次发现的历史终态订单只建立基线；
-活跃订单及后续状态变化才写入 `event_outbox` 并回调。每轮轮询只输出一条汇总日志。
 
 不要把内部接口直接暴露到公网。建议只监听 `127.0.0.1`，或置于仅 Java 可访问的容器网络。
 
@@ -96,19 +65,13 @@ SQLite 数据库 `order_sync_state` 表中。首次发现的历史终态订单�
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/internal/accounts` | 列出已配置账号及连接状态 |
-| GET | `/status` | 连接状态 |
-| POST | `/messages` | 给已有会话发文字 |
-| POST | `/chats` | 创建商品会话 |
-| GET | `/orders` | 卖家订单列表 |
-| GET | `/orders/{orderId}` | 订单详情和稳定状态摘要 |
-| POST | `/orders/{orderId}/deliver` | 虚拟发货，可随后发取餐码 |
-| POST | `/orders/{orderId}/cancel` | 卖家关闭待付款订单；请求体 `{}` |
-| POST | `/items/{itemId}/offline` | 商品下架 |
-| POST | `/orders/{orderId}/price` | 当前固定返回 501 |
-| POST | `/orders/{orderId}/refund` | 当前固定返回 501 |
+| GET | `/health` | 健康检查和实际能力开关，无需签名 |
+| GET | `/internal/accounts` | 列出账号及连接状态 |
+| GET | `/internal/accounts/{accountId}/status` | 查询单个账号连接状态 |
+| POST | `/internal/accounts/{accountId}/chats` | 根据买家和闲鱼商品创建会话 |
+| POST | `/internal/accounts/{accountId}/messages` | 向已有会话发送文字消息 |
 
-健康检查 `/health` 不需要签名，其余接口都需要：
+`/internal/**` 接口使用以下 HMAC 请求头：
 
 ```text
 X-Xianyu-Timestamp: Unix 秒
@@ -118,62 +81,64 @@ X-Xianyu-Signature: hex(HMAC-SHA256(secret, canonical))
 canonical = timestamp + "\n" + nonce + "\n" + METHOD + "\n" + path + "\n" + sha256(rawBody)
 ```
 
-签名实现见 `xianyu_bridge/signature.py`。签名必须基于实际发送的原始 JSON 字节，不能把对象再次序列化。
+签名必须基于实际发送的原始 JSON 字节，不能把对象再次序列化后再计算。
 
-发货请求示例：
+创建会话请求体：
 
 ```json
 {
-  "itemId": "闲鱼商品ID",
-  "buyerId": "买家ID",
-  "chatId": "会话ID",
-  "pickupCode": "老乡鸡取餐码"
+  "buyerId": "闲鱼买家ID",
+  "itemId": "闲鱼商品ID"
 }
 ```
 
-如果闲鱼发货成功但取餐码发送失败，接口返回 502；Java 可安全重试：第二次会识别为已发货，只补发消息，不重复发货。
-
-## Python -> Java 事件
-
-回调体为：
+发送消息请求体：
 
 ```json
 {
-  "event_id": "account:message-or-order-version",
-  "event_type": "CHAT_MESSAGE|ORDER_CREATED|ORDER_PAID|ORDER_UPDATED|ORDER_CLOSED|ORDER_REFUNDED",
+  "chatId": "会话ID",
+  "buyerId": "闲鱼买家ID",
+  "message": "消息文本",
+  "idempotencyKey": "meal-link:本地订单ID"
+}
+```
+
+Sidecar 会按“账号 + 幂等键”生成稳定消息 UUID。创建会话接口只有在闲鱼返回真实会话 ID
+时才返回成功；超时或没有会话 ID 时返回失败/结果未知，Java 不得伪造成功。
+
+## Python -> Java 聊天回调
+
+回调只用于消息上下文和诊断，订单状态不从聊天内容推断。回调体仍保留统一事件结构：
+
+```json
+{
+  "event_id": "account:message-id",
+  "event_type": "CHAT_MESSAGE",
   "account_id": "闲鱼账号ID",
   "occurred_at": 1787462400000,
   "chat_id": "会话ID",
   "message_id": "消息ID",
   "buyer_id": "买家ID",
   "buyer_name": "昵称",
-  "item_id": "商品ID",
-  "order_id": "闲鱼订单ID",
-  "paid_amount": "可信实付金额；无法安全识别时为 null",
-  "content_type": "text|image|card|order_status",
-  "content": "消息内容或状态",
+  "item_id": "闲鱼商品ID",
+  "order_id": "消息中可识别的订单上下文，可为空",
+  "content_type": "text|image|card",
+  "content": "消息内容",
   "raw_payload": {}
 }
 ```
 
-回调使用同一套 HMAC 规则，并额外携带 `X-Xianyu-Event-Id`。Java 必须以该 ID 建唯一索引后再处理，以实现消费幂等。HTTP 成功但业务响应 `code` 非 `0/200` 时，Python 仍视为失败并重试。
+回调使用同一套 HMAC 规则，并携带 `X-Xianyu-Event-Id`。Java 端应按事件 ID 做幂等；HTTP
+成功但业务响应失败时，Sidecar 会重试。订单被拍下、商品状态/价格/库存变化均由闲管家官方
+推送进入 Java 的 `/lxj/goofish/{accountId}/.../push`，不会经过本回调。
 
-## Java 侧适配边界
+## Java 侧职责
 
-`laoxiangji server` 建议只新增四层：
-
-1. `XianyuBridgeClient`：签名调用上述内部 API，设置连接/读取超时。
-2. `XianyuEventController`：校验回调签名和 nonce，仅接收入库，不在 HTTP 线程下单。
-3. `XianyuEventInbox`：以 `event_id` 唯一约束，异步消费并关联本系统订单。
-4. 业务编排：`ORDER_PAID -> 老乡鸡下单 -> 获取取餐码 -> 闲鱼发货并发码`；失败进入可人工重试状态。
-
-订单映射至少保存 `xianyu_account_id / xianyu_order_id / xianyu_item_id / buyer_id / chat_id / lxj_order_id / event_id / status / last_error`。支付、取消、退款和发货都不能由通用 HTTP 重试器自动重放。
-
-Java 调用任何订单或消息接口时都必须显式选择 `accountId`，不要设置全局默认闲鱼账号。
-
-消息与发货接口支持 `idempotencyKey`。Java 应使用稳定业务键（例如 `meal-link:{mealOrderId}`、
-`meal-pickup:{mealOrderId}`）；Sidecar 会按“账号 + 业务键”生成稳定消息 UUID，避免重试重复发消息。
-`/health` 的 `capabilities` 是实际能力开关；当前 `changePrice` 和 `refund` 固定为 `false`，Java 不应自动调用。
+1. `XianyuClient` 只调用 Sidecar 的账号状态、建聊和发消息接口。
+2. `goofish-sdk` 调用闲管家商品列表/详情、订单列表/详情和改价接口，金额使用分，时间使用 Unix 秒。
+3. LXJ Controller 只负责校验并落库商品/订单推送，持久化成功后立即返回；详情查询、匹配商品、建聊和发送短链在后台处理。
+4. 订单推送以“账号 + 订单号 + 修改时间”去重，乱序推送不能覆盖较新数据。
+5. 普通 `CHAT_MESSAGE` 不触发自动建链；订单首次推送且命中商品白名单时，才创建短链并发送消息。
 
 ## 项目结构
 
@@ -187,10 +152,8 @@ xianyu_bridge/
   api.py                     HMAC 内部 API
   accounts.py                多账号 Cookie 仓库
   account_login.py           扫码登录与账号保存
-  parser.py                  结构化消息解析
-  platform.py                卖家订单与写操作
-  order_poll.py              订单轮询补偿
-  outbox.py / callback.py    可靠事件回调
+  parser.py                  私信结构化解析
+  outbox.py / callback.py    可靠聊天事件回调
   manager.py / runtime.py    账号连接与生命周期
 tests/                       离线单元测试，不触发真实闲鱼写操作
 ```
@@ -198,8 +161,8 @@ tests/                       离线单元测试，不触发真实闲鱼写操作
 ## 验证
 
 ```bash
-.venv/bin/python -m unittest discover -v
-.venv/bin/python -m compileall -q .
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m py_compile goofish_live.py xianyu_bridge/*.py tests/*.py
 ```
 
 原始项目及署名信息请参考 Git 历史。

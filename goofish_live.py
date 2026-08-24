@@ -74,6 +74,25 @@ class XianyuLive:
             return f"闲鱼返回非成功状态：{code or '缺少状态码'}"
         return None
 
+    @staticmethod
+    def _find_chat_id(value) -> str | None:
+        """从建聊响应的嵌套 body 中提取会话 ID。"""
+        if isinstance(value, dict):
+            for key in ("chatId", "chatID", "cid", "conversationId", "conversationID"):
+                candidate = value.get(key)
+                if candidate not in (None, ""):
+                    return str(candidate).split("@", 1)[0]
+            for child in value.values():
+                found = XianyuLive._find_chat_id(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = XianyuLive._find_chat_id(child)
+                if found:
+                    return found
+        return None
+
     async def list_all_conversations(self, cid):
         headers = {
             "Cookie": get_session_cookies_str(self.xianyu.session),
@@ -173,8 +192,40 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
-        return {"success": True, "mid": mid}
+        loop = asyncio.get_running_loop()
+        response_future = loop.create_future()
+        self._pending_mid_futures[mid] = response_future
+        try:
+            await ws.send(json.dumps(msg))
+            response = await asyncio.wait_for(
+                asyncio.shield(response_future),
+                timeout=self.SEND_RESPONSE_TIMEOUT_SECONDS,
+            )
+            error = self._send_response_error(response)
+            if error:
+                return {
+                    "success": False,
+                    "mid": mid,
+                    "code": response.get("code"),
+                    "error": error,
+                }
+            chat_id = self._find_chat_id(response.get("body"))
+            if not chat_id:
+                return {
+                    "success": False,
+                    "mid": mid,
+                    "code": response.get("code"),
+                    "error": "闲鱼建聊响应缺少会话ID",
+                }
+            return {"success": True, "mid": mid, "code": response.get("code"), "chatId": chat_id}
+        except TimeoutError:
+            return {"success": False, "mid": mid, "unknown": True, "error": "等待闲鱼建聊确认超时，结果未知"}
+        except Exception as exc:
+            return {"success": False, "mid": mid, "unknown": True, "error": f"等待闲鱼建聊确认失败：{exc}"}
+        finally:
+            pending = self._pending_mid_futures.pop(mid, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     async def send_msg(self, ws, cid, toid, message: Message, message_uuid: str | None = None):
         msg_type = message["type"]

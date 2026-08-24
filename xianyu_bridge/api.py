@@ -12,7 +12,6 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from message import make_text
-from .platform import UnsupportedXianyuOperation, XianyuPlatformError, summarize_order_status
 from .runtime import runtime
 from .signature import verify
 
@@ -72,32 +71,6 @@ class CreateChatRequest(BaseModel):
     itemId: str = Field(min_length=1)
 
 
-class DeliverRequest(BaseModel):
-    itemId: str | None = None
-    buyerId: str | None = None
-    chatId: str | None = None
-    pickupCode: str | None = None
-    idempotencyKey: str | None = Field(default=None, min_length=1, max_length=200)
-
-
-class CancelRequest(BaseModel):
-    """卖家关闭待付款订单。
-
-    闲鱼卖家端只接受预设关闭原因；当前协议固定使用“其他原因”，不允许调用方
-    透传任意文案。
-    """
-
-
-class PriceRequest(BaseModel):
-    amount: str
-    quoteText: str | None = None
-
-
-class RefundRequest(BaseModel):
-    amount: str
-    reason: str
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await runtime.start()
@@ -117,12 +90,7 @@ async def health():
         "capabilities": {
             "multiAccount": True,
             "messages": True,
-            "orderQuery": True,
-            "deliver": True,
-            "cancel": True,
-            "offline": True,
-            "changePrice": False,
-            "refund": False,
+            "createChat": True,
         },
         "accounts": await _account_statuses(),
         "outbox": await asyncio.to_thread(runtime.outbox.stats),
@@ -163,137 +131,6 @@ async def create_chat(account_id: str, req: CreateChatRequest, _: Protected):
     return {"success": bool(result.get("success")), "data": result}
 
 
-@app.get("/internal/accounts/{account_id}/orders")
-async def list_orders(account_id: str, _: Protected, page: int = 1, size: int = 20, queryCode: str = "ALL"):
-    try:
-        return {"success": True, "data": await _thread(runtime.manager.platform(account_id).list_sold_orders, page, size, queryCode)}
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.get("/internal/accounts/{account_id}/items")
-async def list_items(account_id: str, _: Protected, page: int = 1, size: int = 100):
-    try:
-        limit = min(max(size, 1), 100)
-        platform = runtime.manager.platform(account_id)
-        raw_items = []
-        total = 0
-        current_page = max(page, 1)
-        while len(raw_items) < limit:
-            raw = await _thread(platform.list_items, current_page, min(20, limit - len(raw_items)))
-            data = raw.get("data", {}).get("data", {})
-            batch = data.get("itemSearchResponseList", [])
-            total = int(data.get("total") or len(batch))
-            raw_items.extend(batch)
-            if not batch or len(raw_items) >= total:
-                break
-            current_page += 1
-        items = []
-        for item in raw_items:
-            item_id = item.get("itemId")
-            if not item_id:
-                continue
-            status = str(item.get("itemStatus", ""))
-            items.append({
-                "itemId": str(item_id),
-                "title": item.get("title") or f"商品 {item_id}",
-                "status": status,
-                "statusName": "在卖" if status in {"0", "-9"} else "下架",
-                "imageUrl": item.get("picUrl") or item.get("imageUrl"),
-            })
-        return {"success": True, "data": {"list": items, "total": total}}
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.get("/internal/accounts/{account_id}/orders/{order_id}")
-async def order_detail(account_id: str, order_id: str, _: Protected):
-    try:
-        raw = await _thread(runtime.manager.platform(account_id).order_detail, order_id)
-        return {"success": True, "data": {"summary": summarize_order_status(raw), "raw": raw}}
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.post("/internal/accounts/{account_id}/orders/{order_id}/deliver")
-async def deliver(account_id: str, order_id: str, req: DeliverRequest, _: Protected):
-    client = runtime.manager.platform(account_id)
-    try:
-        detail = await _thread(client.order_detail, order_id)
-        summary = summarize_order_status(detail)
-        if summary["status"] == "SHIPPED":
-            confirm = {"alreadyDelivered": True}
-        elif summary["status"] != "PAID":
-            raise HTTPException(status_code=409, detail=f"订单状态不允许发货: {summary['status']}")
-        else:
-            confirm = await _thread(client.confirm_delivery, order_id)
-        message_result = None
-        if req.pickupCode and req.chatId and req.buyerId:
-            live = _live(account_id)
-            if not live.ws:
-                raise HTTPException(status_code=502, detail="闲鱼已发货，但 WebSocket 未连接，取餐码未发送")
-            message_result = await live.send_msg(
-                live.ws,
-                req.chatId,
-                req.buyerId,
-                make_text(f"已为您下单，取餐码：{req.pickupCode}"),
-                _message_uuid(account_id, req.idempotencyKey),
-            )
-        return {"success": True, "data": {"confirm": confirm, "message": message_result}}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.post("/internal/accounts/{account_id}/orders/{order_id}/cancel")
-async def cancel_order(account_id: str, order_id: str, _req: CancelRequest, _: Protected):
-    try:
-        client = runtime.manager.platform(account_id)
-        detail = await _thread(client.order_detail, order_id)
-        status = summarize_order_status(detail)["status"]
-        if status == "CLOSED":
-            data = {"alreadyCancelled": True}
-        elif status != "WAIT_PAYMENT":
-            raise HTTPException(status_code=409, detail=f"订单状态不允许取消: {status}")
-        else:
-            data = await _thread(client.cancel_order, order_id)
-        return {"success": True, "data": data}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.post("/internal/accounts/{account_id}/items/{item_id}/offline")
-async def offline_item(account_id: str, item_id: str, _: Protected):
-    try:
-        data = await _thread(runtime.manager.platform(account_id).offline_item, item_id)
-        return {"success": True, "data": data}
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.post("/internal/accounts/{account_id}/orders/{order_id}/price")
-async def change_price(account_id: str, order_id: str, req: PriceRequest, _: Protected):
-    try:
-        return {"success": True, "data": runtime.manager.platform(account_id).change_price(order_id, req.amount)}
-    except Exception as exc:
-        _platform_error(exc)
-
-
-@app.post("/internal/accounts/{account_id}/orders/{order_id}/refund")
-async def refund(account_id: str, order_id: str, req: RefundRequest, _: Protected):
-    try:
-        return {"success": True, "data": runtime.manager.platform(account_id).refund(order_id, req.amount, req.reason)}
-    except Exception as exc:
-        _platform_error(exc)
-
-
-async def _thread(function, *args):
-    return await asyncio.to_thread(function, *args)
-
-
 async def _account_statuses() -> list[dict]:
     stored = await asyncio.to_thread(runtime.account_store.list_ids)
     active = set(runtime.manager.instances)
@@ -314,13 +151,3 @@ def _message_uuid(account_id: str, idempotency_key: str | None) -> str | None:
     if not idempotency_key:
         return None
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"xianyu:{account_id}:{idempotency_key}"))
-
-
-def _platform_error(exc: Exception):
-    if isinstance(exc, UnsupportedXianyuOperation):
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
-    if isinstance(exc, XianyuPlatformError):
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    if isinstance(exc, KeyError):
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc

@@ -1,4 +1,3 @@
-import json
 import os
 import tempfile
 import unittest
@@ -6,7 +5,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from xianyu_bridge.accounts import AccountStore
-from xianyu_bridge.events import XianyuEvent
 from xianyu_bridge.runtime import BridgeRuntime
 
 
@@ -94,45 +92,6 @@ class RuntimeAccountSyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("1001", manager.started[-1][0])
         self.assertIn("new_123", manager.started[-1][1])
         self.assertEqual(["1002"], manager.stopped)
-
-    async def test_polled_order_recovers_context_from_detail_and_history(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        with patch.dict(
-            os.environ,
-            {
-                "XIANYU_ACCOUNTS_DIR": str(Path(temp.name) / "accounts"),
-                "XIANYU_OUTBOX_PATH": str(Path(temp.name) / "events.db"),
-            },
-        ):
-            bridge = BridgeRuntime()
-        bridge.outbox.enqueue(XianyuEvent(
-            "history", "CHAT_MESSAGE", "a1", 2_000_000_000_000,
-            buyer_id="buyer-1", item_id="item-1", chat_id="chat-1",
-        ))
-
-        class FakePlatform:
-            @staticmethod
-            def order_detail(_order_id):
-                return {"data": {"peerUserId": "buyer-1", "itemId": "item-1"}}
-
-        class FakeManager:
-            @staticmethod
-            def platform(_account_id):
-                return FakePlatform()
-
-        bridge.manager = FakeManager()
-        event = XianyuEvent(
-            "poll", "ORDER_CREATED", "a1", 2_000_000_001_000,
-            item_id="item-1", order_id="o1",
-            content_type="order_status", content="WAIT_PAYMENT",
-        )
-
-        self.assertEqual("ENQUEUED", await bridge.handle_polled_order(event))
-        payload = json.loads(bridge.outbox.due()[-1]["payload"])
-        self.assertEqual("buyer-1", payload["buyer_id"])
-        self.assertEqual("chat-1", payload["chat_id"])
-
 
 if __name__ == "__main__":
     unittest.main()
